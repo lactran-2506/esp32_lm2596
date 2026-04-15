@@ -70,6 +70,19 @@ float filteredI = 0.0f;
 float dacOut = 0.0f;
 bool ccActive = false; // display only: which loop is currently winning
 
+float busVCalScale = 1.0f;
+float busVCalOffset = 0.0f;
+
+float roundVoltageDisplay(float v)
+{
+  return roundf(v * 100.0f) / 100.0f;
+}
+
+float getCalibratedBusVoltage(float rawV)
+{
+  return rawV * busVCalScale + busVCalOffset;
+}
+
 float calcFeedforward(float vTarget)
 {
   float vDac = V_FB_REF + R_DAC * (V_FB_REF / R_BOT - (vTarget - V_FB_REF) / R_TOP);
@@ -95,10 +108,12 @@ void resetController()
   applyDac(calcFeedforward(targetV));
 }
 
-void printStatus(float vout, float currentA)
+void printStatus(float vout, float currentA, float powerW)
 {
-  Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  Dac=%.0f  %s\n",
-                vout, targetV, currentA, iMax, dacOut,
+  float voutRounded = roundVoltageDisplay(vout);
+  float targetVRounded = roundVoltageDisplay(targetV);
+  Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  P=%.3fW  Dac=%.0f  %s\n",
+                voutRounded, targetVRounded, currentA, iMax, powerW, dacOut,
                 ccActive ? "CC" : "CV");
 }
 
@@ -114,7 +129,7 @@ void handleCommand()
 
   if (cmd == "?" || cmd == "status")
   {
-    printStatus(ina226.getBusVoltage(), ina226.getCurrent());
+    printStatus(ina226.getBusVoltage(), ina226.getCurrent(), ina226.getPower());
     return;
   }
 
@@ -123,9 +138,9 @@ void handleCommand()
     float requested = cmd.substring(1).toFloat();
     if (requested >= MIN_TARGET_V && requested <= MAX_TARGET_V)
     {
-      targetV = requested;
+      targetV = roundVoltageDisplay(requested);
       resetController();
-      Serial.printf(">> target=%.3fV ff=%.0f\n", targetV, dacOut);
+      Serial.printf(">> target=%.2fV ff=%.0f\n", targetV, dacOut);
     }
     else
     {
@@ -150,6 +165,44 @@ void handleCommand()
     return;
   }
 
+  if (cmd[0] == 'C' || cmd[0] == 'c')
+  {
+    String args = cmd.substring(1);
+    args.trim();
+    if (args == "?" || args.length() == 0)
+    {
+      Serial.printf("Calibrate bus V: scale=%.6f offset=%.6f\n", busVCalScale, busVCalOffset);
+      Serial.println("Usage: Craw1,ref1,raw2,ref2");
+      return;
+    }
+
+    float raw1 = 0.0f, actual1 = 0.0f, raw2 = 0.0f, actual2 = 0.0f;
+    int p1 = args.indexOf(',');
+    int p2 = args.indexOf(',', p1 + 1);
+    int p3 = args.indexOf(',', p2 + 1);
+    if (p1 < 0 || p2 < 0 || p3 < 0)
+    {
+      Serial.println("Cmd: Craw1,ref1,raw2,ref2");
+      return;
+    }
+
+    raw1 = args.substring(0, p1).toFloat();
+    actual1 = args.substring(p1 + 1, p2).toFloat();
+    raw2 = args.substring(p2 + 1, p3).toFloat();
+    actual2 = args.substring(p3 + 1).toFloat();
+
+    if (fabsf(raw2 - raw1) < 0.0001f)
+    {
+      Serial.println("Calibration points too close");
+      return;
+    }
+
+    busVCalScale = (actual2 - actual1) / (raw2 - raw1);
+    busVCalOffset = actual1 - raw1 * busVCalScale;
+    Serial.printf("Cal set: scale=%.6f offset=%.6f\n", busVCalScale, busVCalOffset);
+    return;
+  }
+
   if (cmd[0] == 'D' || cmd[0] == 'd')
   {
     if (dacMode == DAC_ESP32 && mcpAvailable)
@@ -168,7 +221,7 @@ void handleCommand()
     return;
   }
 
-  Serial.println("Cmd: V5.0 | I0.1 | D | ?");
+  Serial.println("Cmd: V5.00000 | I0.100 | C? | Craw1,ref1,raw2,ref2 | D | ?");
 }
 
 void setup()
@@ -187,8 +240,8 @@ void setup()
   }
 
   ina226.reset();
-  ina226.setAverage(INA226_4_SAMPLES);
-  ina226.setBusVoltageConversionTime(INA226_332_us);
+  ina226.setAverage(INA226_4_SAMPLES); // lấy 4 mẫu và trung bình để giảm nhiễu
+  ina226.setBusVoltageConversionTime(INA226_8300_us);
   ina226.setShuntVoltageConversionTime(INA226_332_us);
   ina226.setModeShuntBusContinuous();
 
@@ -212,11 +265,11 @@ void setup()
   Serial.println("LM2596 CV control ready");
   Serial.printf("DAC: %s, target=%.2fV, ff=%.0f\n",
                 mcpAvailable ? "MCP4725(12-bit)/ESP32(8-bit)" : "ESP32(8-bit)",
-                targetV, dacOut);
+                roundVoltageDisplay(targetV), dacOut);
   Serial.printf("CV: Kp=%.2f Ki=%.1f  CC: Kp=%.0f Ki=%.0f  T=%lums\n",
                 CV_KP, CV_KI, CC_KP, CC_KI, CONTROL_PERIOD_MS);
   Serial.printf("INA226: shunt=%.3f ohm, Imax=%.2f A, ILIM=%.3f A\n", SHUNT_OHMS, MAX_CURRENT_A, iMax);
-  Serial.println("Cmd: V5.0 | I0.1 | D(switch DAC) | ?");
+  Serial.println("Cmd: V5.00000 | I0.100 | D(switch DAC) | ?");
 }
 
 void loop()
@@ -232,7 +285,8 @@ void loop()
   lastControlMs += CONTROL_PERIOD_MS;
 
   float dt = CONTROL_PERIOD_MS / 1000.0f;
-  float vout = ina226.getBusVoltage();
+  float voutRaw = ina226.getBusVoltage();
+  float vout = getCalibratedBusVoltage(voutRaw);
   float rawI = fabsf(ina226.getCurrent());
 
   // ── EMA filter on current (reduces noise, critical at low current) ──
@@ -309,8 +363,10 @@ void loop()
   if ((now - lastPrintMs) >= PRINT_PERIOD_MS)
   {
     lastPrintMs = now;
-    Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  Dac=%.0f  %s  [%s]\n",
-                  vout, targetV, currentA, iMax, dacOut,
+    float powerW = vout * currentA;
+    Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  P=%.3fW  Dac=%.0f  %s  [%s]\n",
+                  roundVoltageDisplay(vout), roundVoltageDisplay(targetV), currentA, iMax,
+                  powerW, dacOut,
                   ccActive ? "CC" : "CV",
                   (dacMode == DAC_MCP4725) ? "MCP" : "ESP");
   }
