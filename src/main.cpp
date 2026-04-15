@@ -37,17 +37,25 @@ float dacMax = DAC_MAX_ESP32;
 static const unsigned long CONTROL_PERIOD_MS = 35;
 static const unsigned long PRINT_PERIOD_MS = 500;
 
-static const float MIN_TARGET_V = 1.2f;
+static const float MIN_TARGET_V = 0.2f;
 static const float MAX_TARGET_V = 24.0f;
 
-// CV: direct correction gain (0.0-1.0, higher = faster, risk oscillation)
-static const float CV_ALPHA = 0.95f;
+// ── Dual-loop CC/CV architecture (professional power supply style) ──
+// Both loops run simultaneously. The most restrictive output wins.
+// Higher DAC = lower Vout (LM2596 inverted feedback).
 
-// CC mode: direct current correction with adaptive gain
-// Uses current error to shift DAC output and keep current near iMax.
-static const float KP_CC = 50.0f;
-static const float KI_CC = 6.0f;
-static const float CC_INTEGRAL_LIMIT = 250.0f;
+// CV loop: feedforward + PI correction
+static const float CV_KP = 0.55f;        // proportional gain — reduced to prevent oscillation
+static const float CV_KI = 3.0f;         // integral gain — slower to avoid overshoot
+static const float CV_INT_LIMIT = 30.0f; // integral clamp (DAC-equivalent units)
+
+// CC loop: PI on current error
+static const float CC_KP = 80.0f;     // proportional gain (DAC per amp error, scaled)
+static const float CC_KI = 160.0f;    // integral gain
+static const float CC_INT_MAX = 1.5f; // integral clamp (amp-seconds) — enough authority to hold current
+
+// Current measurement EMA filter (0.0-1.0, lower = more filtering)
+static const float I_FILTER_ALPHA = 0.45f;
 
 float iMax = 0.5f;
 
@@ -56,15 +64,11 @@ MCP4725 mcp4725(MCP4725_ADDR);
 bool mcpAvailable = false;
 
 float targetV = 5.0f;
+float integralCV = 0.0f;
 float integralCC = 0.0f;
+float filteredI = 0.0f;
 float dacOut = 0.0f;
-
-enum
-{
-  CC_OFF = 0,
-  CC_PID
-} ccState = CC_OFF;
-bool ccCurrentSeen = false;
+bool ccActive = false; // display only: which loop is currently winning
 
 float calcFeedforward(float vTarget)
 {
@@ -84,9 +88,10 @@ void applyDac(float value)
 
 void resetController()
 {
+  integralCV = 0.0f;
   integralCC = 0.0f;
-  ccState = CC_OFF;
-  ccCurrentSeen = false;
+  filteredI = 0.0f;
+  ccActive = false;
   applyDac(calcFeedforward(targetV));
 }
 
@@ -94,7 +99,7 @@ void printStatus(float vout, float currentA)
 {
   Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  Dac=%.0f  %s\n",
                 vout, targetV, currentA, iMax, dacOut,
-                (ccState == CC_OFF) ? "CV" : "CC");
+                ccActive ? "CC" : "CV");
 }
 
 void handleCommand()
@@ -208,7 +213,8 @@ void setup()
   Serial.printf("DAC: %s, target=%.2fV, ff=%.0f\n",
                 mcpAvailable ? "MCP4725(12-bit)/ESP32(8-bit)" : "ESP32(8-bit)",
                 targetV, dacOut);
-  Serial.printf("CV: alpha=%.2f  T=%lums\n", CV_ALPHA, CONTROL_PERIOD_MS);
+  Serial.printf("CV: Kp=%.2f Ki=%.1f  CC: Kp=%.0f Ki=%.0f  T=%lums\n",
+                CV_KP, CV_KI, CC_KP, CC_KI, CONTROL_PERIOD_MS);
   Serial.printf("INA226: shunt=%.3f ohm, Imax=%.2f A, ILIM=%.3f A\n", SHUNT_OHMS, MAX_CURRENT_A, iMax);
   Serial.println("Cmd: V5.0 | I0.1 | D(switch DAC) | ?");
 }
@@ -227,74 +233,85 @@ void loop()
 
   float dt = CONTROL_PERIOD_MS / 1000.0f;
   float vout = ina226.getBusVoltage();
-  float currentA = fabsf(ina226.getCurrent());
+  float rawI = fabsf(ina226.getCurrent());
+
+  // ── EMA filter on current (reduces noise, critical at low current) ──
+  filteredI = I_FILTER_ALPHA * rawI + (1.0f - I_FILTER_ALPHA) * filteredI;
+  float currentA = filteredI;
 
   float ff = calcFeedforward(targetV);
+  float dacScale = dacMax / 255.0f; // normalize gains across 8-bit and 12-bit DAC
 
-  // ── CC state machine ──────────────────────────────────
-  if (ccState == CC_OFF)
+  // ═══════════════════════════════════════════════════════════════
+  // CV Loop: feedforward + PI correction
+  // Keeps Vout = targetV. Computes an absolute DAC target.
+  // cvErrDac > 0 → Vout too high → need higher DAC (lower Vout)
+  // cvErrDac < 0 → Vout too low  → need lower  DAC (raise Vout)
+  // ═══════════════════════════════════════════════════════════════
+  float cvErrDac = ff - calcFeedforward(vout);
+  integralCV += cvErrDac * dt;
+  integralCV = constrain(integralCV, -CV_INT_LIMIT, CV_INT_LIMIT);
+  float dacCV = ff + CV_KP * cvErrDac + CV_KI * integralCV;
+  dacCV = constrain(dacCV, 0.0f, dacMax);
+
+  // ═══════════════════════════════════════════════════════════════
+  // CC Loop: PI on current error
+  // Keeps Iout ≤ iMax. When overcurrent, pushes DAC up (lower Vout).
+  // errI > 0 → overcurrent → increase DAC
+  // errI < 0 → undercurrent → CC should release (integral drains to 0)
+  // ═══════════════════════════════════════════════════════════════
+  float errI = currentA - iMax;
+  if (errI >= 0.0f)
   {
-    if (currentA >= iMax)
-    {
-      ccCurrentSeen = false;
-      ccState = CC_PID;
-      // Phản ứng nhanh: giảm Vout ngay để đưa CC vào vùng điều khiển,
-      // nhưng hạn chế lực tác động khi Vset thấp để tránh nhiễu và dao động.
-      float kickFactor = (targetV < 5.0f) ? 0.08f : 0.18f;
-      float kick = dacOut + dacMax * kickFactor;
-      applyDac(constrain(kick, ff, dacMax));
-    }
+    // Overcurrent: accumulate integral normally
+    integralCC += errI * dt;
   }
-  else // CC_PID
+  else
   {
-    // Đánh dấu khi đã thấy dòng gần iMax
-    if (currentA >= iMax * 0.5f)
-      ccCurrentSeen = true;
+    // Undercurrent: fast proportional drain — the more undercurrent, the faster release
+    // At zero load (errI ≈ -iMax), drains integral in ~3-5 cycles
+    float drainRate = fabsf(errI) / max(iMax, 0.01f); // 0..1, proportional to how far below
+    integralCC *= (1.0f - constrain(drainRate * 0.5f, 0.1f, 0.8f));
+    if (integralCC < 0.001f)
+      integralCC = 0.0f;
+  }
+  integralCC = constrain(integralCC, 0.0f, CC_INT_MAX);
+  float dacCC = ff + CC_KP * max(0.0f, errI) * dacScale + CC_KI * integralCC * dacScale;
+  dacCC = constrain(dacCC, ff, dacMax); // CC never pushes DAC below CV feedforward
 
-    // Thoát CC khi tải rút: đã từng thấy dòng VÀ dòng giảm về ~0
-    if (ccCurrentSeen && currentA < 0.05f)
-    {
-      // Thoát CC → CV sẽ tự correct từ dacOut hiện tại
-      ccState = CC_OFF;
-      ccCurrentSeen = false;
-    }
-    else
-    {
-      // Direct current control: adjust DAC based on error from iMax.
-      // Use smaller gain at low voltage and limit per-step change to keep CC stable.
-      float errI = currentA - iMax;
-      float voltageFactor = constrain((vout + 1.0f) / 10.0f, 0.25f, 1.0f);
-      float scale = 0.08f * (dacMax / 255.0f) * voltageFactor;
-      float maxStep = dacMax * (targetV < 6.0f ? 0.02f : 0.035f);
-      if (fabsf(errI) < 0.01f)
-        errI = 0.0f; // deadband to avoid small oscillations
-      float step = constrain(errI * KP_CC * scale, -maxStep, maxStep);
-      float dacNew = dacOut + step;
-      applyDac(constrain(dacNew, ff, dacMax));
-    }
+  // ═══════════════════════════════════════════════════════════════
+  // Minimum Select: most restrictive wins
+  // Higher DAC = lower Vout = more restrictive (LM2596 inverted FB)
+  // ═══════════════════════════════════════════════════════════════
+  float dacFinal = max(dacCV, dacCC);
+  applyDac(dacFinal);
+  ccActive = (dacCC > dacCV);
+
+  // ═══════════════════════════════════════════════════════════════
+  // Anti-windup: prevent the inactive loop's integrator from diverging
+  // ═══════════════════════════════════════════════════════════════
+  if (ccActive)
+  {
+    // CC is overriding CV → Vout < Vset.
+    // Reset CV integral to 0 so that when CC releases, dacCV immediately
+    // snaps to feedforward(targetV) → voltage recovers instantly.
+    integralCV = 0.0f;
+  }
+  else
+  {
+    // CV is active, CC is idle → fast-drain CC integral for quick release.
+    integralCC *= 0.60f;
+    if (integralCC < 0.001f)
+      integralCC = 0.0f;
   }
 
+  // ── Periodic status print ─────────────────────────────────
   if ((now - lastPrintMs) >= PRINT_PERIOD_MS)
   {
     lastPrintMs = now;
     Serial.printf("V=%.2f(Vset=%.2f)  I=%.3fA(Imax=%.2f)  Dac=%.0f  %s  [%s]\n",
                   vout, targetV, currentA, iMax, dacOut,
-                  (ccState == CC_OFF) ? "CV" : "CC",
+                  ccActive ? "CC" : "CV",
                   (dacMode == DAC_MCP4725) ? "MCP" : "ESP");
-  }
-
-  if (ccState != CC_OFF)
-    return; // không chạy CV khi đang CC
-
-  // ── CV: Direct correction ───────────────────────
-  // Calculate the DAC adjustment required to move measured Vout toward targetV.
-  // Use the feedforward model for actual voltage and target voltage; then apply a
-  // fraction of the difference to the DAC output for fast convergence.
-  {
-    float ff_target = calcFeedforward(targetV);
-    float ff_measured = calcFeedforward(vout);
-    float correction = ff_target - ff_measured;
-    float dacNew = dacOut + CV_ALPHA * correction;
-    applyDac(constrain(dacNew, 0.0f, dacMax));
   }
 }
