@@ -166,6 +166,8 @@ LGFX lcd;
 // Allocated in PSRAM; pushSprite() sends a single DMA block to the display.
 static LGFX_Sprite rowSprite(&lcd);
 static bool rowSpriteOk = false;
+static int psuRowSpriteH = 80;
+static int psuRowTextY = 40;
 
 // ── Màu sắc (theo style ESP32-JBC-C245-POWER) ───────────────────────────
 #define COLOR_BG 0x0000
@@ -265,8 +267,15 @@ static float voltLastMv = -9999.0f;
 static float voltDisplayMv = -9999.0f;
 static bool voltLastIsAc = false;
 static bool voltLastNeg = false;
-static const float VOLT_DISPLAY_ALPHA = 0.45f;
+static bool voltLastOverload = false;
+static const float VOLT_DISPLAY_ALPHA_SLOW = 0.42f;
+static const float VOLT_DISPLAY_ALPHA_FAST = 0.78f;
+static const float VOLT_FAST_STEP_MV = 220.0f;
 static const float VOLT_UPDATE_DEADBAND_MV = 30.0f;
+static const float OHM_VALUE_DEADBAND_OHM = 0.2f;
+static const float OHM_ADC_DEADBAND_MV = 12.0f;
+static const float DIODE_ADC_DEADBAND_MV = 8.0f;
+static const float CAP_VALUE_DEADBAND_PF = 500.0f;
 // ── Capacitance state ───────────────────────────────────────────────────
 static float capLastPf = -1.0f;
 // ── CAP task result handoff (Core0 → Core1) ──────────────────────────────
@@ -327,6 +336,12 @@ static Button voltRangeButtons[] = {
     {6, 160, 88, 28, "165V", COLOR_BTN},
 };
 
+// Touch hitbox padding (visual button size stays unchanged).
+static constexpr int TOUCH_PAD_NUMPAD = 6;
+static constexpr int TOUCH_PAD_VOLT_RANGE = 10;
+static constexpr int TOUCH_PAD_MODE_BAR_Y = 8;
+static constexpr int TOUCH_PAD_SET_BAR = 10;
+
 // ── Helper ───────────────────────────────────────────────────────────────
 static void drawCard(int x, int y, int w, int h, uint16_t borderColor)
 {
@@ -352,7 +367,13 @@ static void drawButton(int x, int y, int w, int h, const char *text, uint16_t co
 // Right panel X boundary + tab bar height (used by drawTabBar and drawUiFrame)
 #define RPX 310
 #define RPW (480 - RPX)
-#define TAB_H 24
+#define TAB_H 40
+#define MM_VALUE_Y (TAB_H + 28)
+#define MM_ADC_BAR_Y 216
+#define MM_ADC_BAR_H 30
+#define MM_STATUS_Y 252
+#define MM_STATUS_H 39
+#define MM_STATUS_TEXT_Y (MM_STATUS_Y + 14)
 
 // ── Tab bar ───────────────────────────────────────────────────────────────
 static void drawTabBar(AppTab tab)
@@ -583,38 +604,6 @@ static void drawVoltRangeButtons(bool force = false)
   }
 }
 
-static const char *meterModeHeader()
-{
-  if (meterMode == MeterMode::OHM)
-    return "DONG HO  //  OHM METER  //  Auto Range  //  Ref 3.3V";
-  if (meterMode == MeterMode::DIODE)
-    return "DONG HO  //  DIODE TEST  //  1kOhm R  //  Ref 3.3V";
-  if (meterMode == MeterMode::VOLT_DC)
-  {
-    if (voltRangeMode == VoltRangeMode::AUTO)
-    {
-      return voltRange == VoltRange::LO
-                 ? "DONG HO  //  VOLT DC  //  Auto Range  //  100k/10k LO"
-                 : "DONG HO  //  VOLT DC  //  Auto Range  //  100k/1k HI";
-    }
-    if (voltRangeMode == VoltRangeMode::FIXED_18V)
-      return "DONG HO  //  VOLT DC  //  18V range  //  100k/10k LO";
-    return "DONG HO  //  VOLT DC  //  165V range  //  100k/1k HI";
-  }
-  if (meterMode == MeterMode::VOLT_AC)
-  {
-    if (voltRangeMode == VoltRangeMode::AUTO)
-    {
-      return voltRange == VoltRange::LO
-                 ? "DONG HO  //  VOLT AC~  //  RMS 240samp  //  100k/10k LO"
-                 : "DONG HO  //  VOLT AC~  //  RMS 240samp  //  100k/1k HI";
-    }
-    if (voltRangeMode == VoltRangeMode::FIXED_18V)
-      return "DONG HO  //  VOLT AC~  //  18V range  //  100k/10k LO";
-    return "DONG HO  //  VOLT AC~  //  165V range  //  100k/1k HI";
-  }
-  return "DONG HO  //  CAP+ESR METER  //  RC + 100Ohm Pulse  //  Ref 3.3V";
-}
 static const char *meterModeLabel()
 {
   if (meterMode == MeterMode::OHM)
@@ -636,7 +625,7 @@ static const char *meterModeLabel()
 static void capUpdateDisplay(float pF, bool capOL, bool tooSmall,
                              float esrOhm, bool esrOL, bool esrTooLow)
 {
-  bool capChg = (pF != capLastPf || capOL != ohmLastOL);
+  bool capChg = (fabsf(pF - capLastPf) > CAP_VALUE_DEADBAND_PF || capOL != ohmLastOL || tooSmall != capRes_tooSmall);
   bool esrChg = (fabsf(esrOhm - esrLastOhm) > 0.05f);
   if (!capChg && !esrChg)
     return;
@@ -724,17 +713,17 @@ static void capUpdateDisplay(float pF, bool capOL, bool tooSmall,
       ohmValSprite.drawString(numBuf, 10, 100);
     }
 
-    ohmValSprite.pushSprite(5, TAB_H + 46);
+    ohmValSprite.pushSprite(5, MM_VALUE_Y);
   }
 
   // Status badge
-  lcd.fillRect(5, TAB_H + 229, 470, 39, COLOR_BG);
+  lcd.fillRect(5, MM_STATUS_Y, 470, MM_STATUS_H, COLOR_BG);
   if (!capOL)
   {
     lcd.setTextFont(2);
     lcd.setTextColor(COLOR_LABEL, COLOR_BG);
     lcd.setTextDatum(ML_DATUM);
-    lcd.drawString(pF >= 1e6f ? "Cap: 10k  |  ESR: 100 Ohm" : "Cap: 100k  |  ESR: 100 Ohm", 10, TAB_H + 243);
+    lcd.drawString(pF >= 1e6f ? "Cap: 10k  |  ESR: 100 Ohm" : "Cap: 100k  |  ESR: 100 Ohm", 10, MM_STATUS_TEXT_Y);
     lcd.setTextDatum(TL_DATUM);
   }
 }
@@ -1067,11 +1056,11 @@ static void capTick()
     // Draw info bar
     if (capRes_esrOhm >= 0.0f && !capRes_OL && capRes_infoBuf[0])
     {
-      lcd.fillRect(5, TAB_H + 196, 470, 30, 0x1082u);
+      lcd.fillRect(5, MM_ADC_BAR_Y, 470, MM_ADC_BAR_H, 0x1082u);
       lcd.setTextFont(2);
       lcd.setTextColor(COLOR_LABEL, 0x1082u);
       lcd.setTextDatum(ML_DATUM);
-      lcd.drawString(capRes_infoBuf, 10, TAB_H + 211);
+      lcd.drawString(capRes_infoBuf, 10, MM_ADC_BAR_Y + 15);
       lcd.setTextDatum(TL_DATUM);
     }
     capUpdateDisplay(capRes_pF, capRes_OL, capRes_tooSmall,
@@ -1139,14 +1128,14 @@ static void diodeUpdateDisplay(float vfMv, bool ol)
       ohmValSprite.setTextDatum(MC_DATUM);
       ohmValSprite.drawString(clsText, 210, 105);
     }
-    ohmValSprite.pushSprite(5, TAB_H + 46);
+    ohmValSprite.pushSprite(5, MM_VALUE_Y);
   }
   // Status row
-  lcd.fillRect(5, TAB_H + 229, 470, 39, COLOR_BG);
+  lcd.fillRect(5, MM_STATUS_Y, 470, MM_STATUS_H, COLOR_BG);
   lcd.setTextFont(4);
   lcd.setTextColor(clsColor, COLOR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString(clsText, 10, TAB_H + 243);
+  lcd.drawString(clsText, 10, MM_STATUS_TEXT_Y);
   lcd.setTextDatum(TL_DATUM);
 }
 static void diodeTick()
@@ -1161,21 +1150,21 @@ static void diodeTick()
   bool ol = (vmV < 30.0f); // no current → open or reversed
   diodeUpdateDisplay(vfMv, ol);
   // ADC bar
-  if (vmV != ohmLastVmV)
+  if (fabsf(vmV - ohmLastVmV) > DIODE_ADC_DEADBAND_MV)
   {
     ohmLastVmV = vmV;
     char buf[32];
-    lcd.fillRect(5, TAB_H + 196, 470, 30, 0x1082u);
+    lcd.fillRect(5, MM_ADC_BAR_Y, 470, MM_ADC_BAR_H, 0x1082u);
     float pct = vmV / OHM_VREF_MV;
     if (pct > 1.0f)
       pct = 1.0f;
-    lcd.fillRect(5, TAB_H + 196, (int)(470 * pct), 30,
+    lcd.fillRect(5, MM_ADC_BAR_Y, (int)(470 * pct), MM_ADC_BAR_H,
                  ol ? (uint32_t)COLOR_OFF : (uint32_t)COLOR_AMP);
     lcd.setTextFont(2);
     lcd.setTextColor(COLOR_TEXT, 0x1082u);
     lcd.setTextDatum(MR_DATUM);
     snprintf(buf, sizeof(buf), "Vadc=%.0f mV  Vf=%.0f mV", vmV, vfMv);
-    lcd.drawString(buf, 475, TAB_H + 211);
+    lcd.drawString(buf, 475, MM_ADC_BAR_Y + 15);
     lcd.setTextDatum(TL_DATUM);
   }
   Serial.printf("[DIODE] Vadc=%.1f mV  Vf=%.1f mV  %s\n",
@@ -1187,17 +1176,8 @@ static void drawMultimeterScreen()
   lcd.fillScreen(COLOR_BG);
   drawTabBar(AppTab::Multimeter);
 
-  // Header strip
-  lcd.fillRect(0, TAB_H, 480, 28, COLOR_PANEL);
-  lcd.drawFastHLine(0, TAB_H + 28, 480, 0x07FFu);
-  lcd.setTextFont(2);
-  lcd.setTextColor(0x07FFu, COLOR_PANEL);
-  lcd.setTextDatum(ML_DATUM);
-  lcd.drawString(meterModeHeader(), 10, TAB_H + 14);
-  lcd.setTextDatum(TL_DATUM);
-
   // Value area background
-  lcd.fillRect(0, TAB_H + 29, 480, 160, TFT_BLACK);
+  lcd.fillRect(0, TAB_H, 480, 292 - TAB_H, TFT_BLACK);
 
   // Reset cached values
   ohmLastRx = -1.0f;
@@ -1205,6 +1185,7 @@ static void drawMultimeterScreen()
   ohmLastVf = -1.0f;
   capLastPf = -1.0f;
   voltLastMv = -9999.0f;
+  voltLastOverload = false;
   ohmLastOL = false;
   ohmLastRange = (OhmRange)99;
 
@@ -1212,18 +1193,14 @@ static void drawMultimeterScreen()
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
   lcd.setTextDatum(TL_DATUM);
-  lcd.drawString(meterModeLabel(), 10, TAB_H + 30);
+  lcd.drawString(meterModeLabel(), 10, TAB_H + 8);
   drawVoltRangeButtons(true);
 
-  // ADC section  (sep y=201, label y=203, bar y=220..249)
-  lcd.drawFastHLine(0, TAB_H + 177, 480, COLOR_BORDER);
+  // ADC/Charge label
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_LABEL, COLOR_BG);
   lcd.setTextDatum(TL_DATUM);
-  lcd.drawString(meterMode == MeterMode::CAP ? "Charge Time" : "ADC Voltage", 10, TAB_H + 179);
-
-  // Range / Status section  (sep y=252, content y=263 center)
-  lcd.drawFastHLine(0, TAB_H + 228, 480, COLOR_BORDER);
+  lcd.drawString(meterMode == MeterMode::CAP ? "Charge Time" : "ADC Voltage", 10, MM_ADC_BAR_Y - 12);
 
   drawMeterModeButtons();
 }
@@ -1232,7 +1209,7 @@ static void ohmUpdateDisplay(float rx, float vmV, bool overload)
 {
   char numBuf[24];
   const char *unit;
-  bool changed = (rx != ohmLastRx || overload != ohmLastOL);
+  bool changed = (fabsf(rx - ohmLastRx) > OHM_VALUE_DEADBAND_OHM || overload != ohmLastOL);
 
   // ── Resistance value (big font, sprite) ─────────────────────────────
   if (changed)
@@ -1282,25 +1259,25 @@ static void ohmUpdateDisplay(float rx, float vmV, bool overload)
         ohmValSprite.drawString(unit, 358, 65);
         ohmValSprite.unloadFont();
       }
-      ohmValSprite.pushSprite(5, TAB_H + 46);
+      ohmValSprite.pushSprite(5, MM_VALUE_Y);
     }
   }
 
   // ── ADC voltage bar ──────────────────────────────────────────────────
-  if (vmV != ohmLastVmV)
+  if (fabsf(vmV - ohmLastVmV) > OHM_ADC_DEADBAND_MV)
   {
     ohmLastVmV = vmV;
-    lcd.fillRect(5, TAB_H + 196, 470, 30, 0x1082u);
+    lcd.fillRect(5, MM_ADC_BAR_Y, 470, MM_ADC_BAR_H, 0x1082u);
     float pct = vmV / OHM_VREF_MV;
     if (pct > 1.0f)
       pct = 1.0f;
     bool inRange = (pct >= OHM_THRESH_LO && pct <= OHM_THRESH_HI);
-    lcd.fillRect(5, TAB_H + 196, (int)(470 * pct), 30, inRange ? (uint32_t)COLOR_VOLT : (uint32_t)COLOR_WATT);
+    lcd.fillRect(5, MM_ADC_BAR_Y, (int)(470 * pct), MM_ADC_BAR_H, inRange ? (uint32_t)COLOR_VOLT : (uint32_t)COLOR_WATT);
     lcd.setTextFont(2);
     lcd.setTextColor(COLOR_TEXT, 0x1082u);
     lcd.setTextDatum(MR_DATUM);
     snprintf(numBuf, sizeof(numBuf), "%.0f mV  (%.0f%%)", vmV, pct * 100.0f);
-    lcd.drawString(numBuf, 475, TAB_H + 211);
+    lcd.drawString(numBuf, 475, MM_ADC_BAR_Y + 15);
     lcd.setTextDatum(TL_DATUM);
   }
 
@@ -1308,11 +1285,11 @@ static void ohmUpdateDisplay(float rx, float vmV, bool overload)
   if (ohmRange != ohmLastRange)
   {
     ohmLastRange = ohmRange;
-    lcd.fillRect(5, TAB_H + 229, 470, 39, COLOR_BG);
+    lcd.fillRect(5, MM_STATUS_Y, 470, MM_STATUS_H, COLOR_BG);
     lcd.setTextFont(4);
     lcd.setTextColor(COLOR_WATT, COLOR_BG);
     lcd.setTextDatum(ML_DATUM);
-    lcd.drawString(ohmRangeName(ohmRange), 10, TAB_H + 243);
+    lcd.drawString(ohmRangeName(ohmRange), 10, MM_STATUS_TEXT_Y);
     lcd.setTextDatum(TL_DATUM);
   }
 }
@@ -1321,7 +1298,7 @@ static void ohmUpdateDisplay(float rx, float vmV, bool overload)
 // Voltmeter display + tick
 // ════════════════════════════════════════════════════════════════════════
 
-// Sprite riêng cho 3 nút AUTO/18V/165V (90×132, push tại 5, TAB_H+46)
+  // Sprite riêng cho 3 nút AUTO/18V/165V (90×132, push tại 5, MM_VALUE_Y)
 // Chỉ render lại nội dung khi voltRangeMode thay đổi; luôn push để phủ lại
 // vùng nút sau khi ohmValSprite đè lên.
 static void updateVoltBtnSprite()
@@ -1337,7 +1314,7 @@ static void updateVoltBtnSprite()
   {
     lastBtnMode = voltRangeMode;
     voltBtnSprite.fillSprite(TFT_BLACK);
-    // Tọa độ sprite: button[i] screen y=84/122/160, sprite pushed y=TAB_H+46=70
+    // Tọa độ sprite: button[i] screen y=84/122/160, sprite pushed y=MM_VALUE_Y
     // → relative y = 84-70=14, 122-70=52, 160-70=90
     const int ry[3] = {14, 52, 90};
     const char *lbl[3] = {"AUTO", "18V", "165V"};
@@ -1358,7 +1335,7 @@ static void updateVoltBtnSprite()
     voltBtnSprite.setTextDatum(TL_DATUM);
   }
   // Luôn push để phủ lại nút sau khi value sprite đè
-  voltBtnSprite.pushSprite(5, TAB_H + 46);
+  voltBtnSprite.pushSprite(5, MM_VALUE_Y);
 }
 
 static void voltActivateRange(VoltRange r)
@@ -1386,21 +1363,19 @@ static void voltActivateRange(VoltRange r)
 // vinMv = signed real voltage (negative = minus).  isAc = true → show RMS ~
 static void voltUpdateDisplay(float vinMv, bool overload, VoltRange rng, bool isAc)
 {
-  if (!ohmSpriteOk)
-  {
-    ohmValSprite.createSprite(420, 130);
-    ohmSpriteOk = true;
-  }
-  ohmValSprite.fillSprite(TFT_BLACK);
-  ohmValSprite.setTextDatum(MR_DATUM);
-
+  const int valueX = 100; // keep left side buttons untouched
+  const int valueW = 375;
+  const int valueY = MM_VALUE_Y;
+  const int valueH = 130;
+  lcd.fillRect(valueX, valueY, valueW, valueH, TFT_BLACK);
+  lcd.setTextDatum(MR_DATUM);
   char numBuf[32];
   if (overload)
   {
-    ohmValSprite.loadFont(Weimar_Medium_70);
-    ohmValSprite.setTextColor(0xF800u, TFT_BLACK);
-    ohmValSprite.drawString("OL", 380, 55);
-    ohmValSprite.unloadFont();
+    lcd.loadFont(Weimar_Medium_70);
+    lcd.setTextColor(0xF800u, TFT_BLACK);
+    lcd.drawString("OL", 380, valueY + 55);
+    lcd.unloadFont();
   }
   else
   {
@@ -1421,17 +1396,17 @@ static void voltUpdateDisplay(float vinMv, bool overload, VoltRange rng, bool is
     {
       snprintf(numBuf, sizeof(numBuf), "~%.2f", absV / 1000.0f);
     }
-    ohmValSprite.loadFont(Weimar_Medium_70);
-    ohmValSprite.setTextColor(col, TFT_BLACK);
-    ohmValSprite.drawString(numBuf, 320, 55);
-    ohmValSprite.unloadFont();
-    ohmValSprite.loadFont(Weimar_Medium_26);
-    ohmValSprite.setTextColor(0xC618u, TFT_BLACK);
-    ohmValSprite.setTextDatum(ML_DATUM);
-    ohmValSprite.drawString(unit, 328, 68);
-    ohmValSprite.unloadFont();
+    lcd.loadFont(Weimar_Medium_70);
+    lcd.setTextColor(col, TFT_BLACK);
+    lcd.drawString(numBuf, 320, valueY + 55);
+    lcd.unloadFont();
+    lcd.loadFont(Weimar_Medium_26);
+    lcd.setTextColor(0xC618u, TFT_BLACK);
+    lcd.setTextDatum(ML_DATUM);
+    lcd.drawString(unit, 328, valueY + 68);
+    lcd.unloadFont();
   }
-  ohmValSprite.pushSprite(5, TAB_H + 46);
+  lcd.setTextDatum(TL_DATUM);
 
   // ── Range + AC/DC badge
   char badge[64];
@@ -1440,11 +1415,11 @@ static void voltUpdateDisplay(float vinMv, bool overload, VoltRange rng, bool is
   float rBotD = (rng == VoltRange::LO) ? OHM_R_10K : OHM_R_1K;
   float gainD = (VOLT_R_TOP + rBotD) / rBotD;
   snprintf(badge, sizeof(badge), "Range: %s  |  %s  |  Mid=1.65V", rngStr, modStr);
-  lcd.fillRect(5, TAB_H + 229, 470, 39, COLOR_BG);
+  lcd.fillRect(5, MM_STATUS_Y, 470, MM_STATUS_H, COLOR_BG);
   lcd.setTextFont(4);
   lcd.setTextColor(COLOR_WATT, COLOR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString(badge, 10, TAB_H + 243);
+  lcd.drawString(badge, 10, MM_STATUS_TEXT_Y);
   lcd.setTextDatum(TL_DATUM);
 
   // ── ADC bar: width proportional to |Vin| / max positive Vin
@@ -1465,19 +1440,17 @@ static void voltUpdateDisplay(float vinMv, bool overload, VoltRange rng, bool is
                     : isAc             ? 0xFD20u
                     : (vinMv < -20.0f) ? 0xF81Fu
                                        : 0x07E0u;
-  lcd.fillRect(5, TAB_H + 196, 470, 30, 0x1082u);
-  lcd.fillRect(5, TAB_H + 196, (int)(470 * pct), 30, barCol);
+  lcd.fillRect(5, MM_ADC_BAR_Y, 470, MM_ADC_BAR_H, 0x1082u);
+  lcd.fillRect(5, MM_ADC_BAR_Y, (int)(470 * pct), MM_ADC_BAR_H, barCol);
   char rbuf[48];
   float vadcNow = (float)analogReadMilliVolts(OHM_ADC_PIN);
   snprintf(rbuf, sizeof(rbuf), "Vadc=%.0f mV  mid=1650mV  (%.0f%%)", vadcNow, pct * 100.0f);
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_TEXT, 0x1082u);
   lcd.setTextDatum(MR_DATUM);
-  lcd.drawString(rbuf, 475, TAB_H + 211);
+  lcd.drawString(rbuf, 475, MM_ADC_BAR_Y + 15);
   lcd.setTextDatum(TL_DATUM);
 
-  // Sprite riêng phủ lại nút (chỉ render nội dung khi mode đổi, luôn push)
-  updateVoltBtnSprite();
 }
 
 static void voltTick()
@@ -1554,17 +1527,21 @@ static void voltTick()
   }
   else
   {
-    voltDisplayMv = VOLT_DISPLAY_ALPHA * vinMv + (1.0f - VOLT_DISPLAY_ALPHA) * voltDisplayMv;
+    float stepMv = fabsf(vinMv - voltDisplayMv);
+    float alpha = (stepMv > VOLT_FAST_STEP_MV) ? VOLT_DISPLAY_ALPHA_FAST : VOLT_DISPLAY_ALPHA_SLOW;
+    voltDisplayMv = alpha * vinMv + (1.0f - alpha) * voltDisplayMv;
   }
 
   bool displayChange = fabsf(voltDisplayMv - voltLastMv) > VOLT_UPDATE_DEADBAND_MV;
   bool signChange = (voltDisplayMv < -20.0f) != voltLastNeg;
 
-  if (displayChange || overload || isAc != voltLastIsAc || signChange)
+  bool overloadChange = (overload != voltLastOverload);
+  if (displayChange || overloadChange || isAc != voltLastIsAc || signChange)
   {
     voltLastMv = voltDisplayMv;
     voltLastIsAc = isAc;
     voltLastNeg = (voltDisplayMv < -20.0f);
+    voltLastOverload = overload;
     voltUpdateDisplay(voltDisplayMv, overload, voltRange, isAc);
     Serial.printf("[VOLT] %s Range=%s  Vadc=%.1f  std=%.1f  Vin=%.3f V\n",
                   isAc ? "AC~" : (vinMv < 0 ? "DC-" : "DC+"),
@@ -1628,12 +1605,20 @@ static void ohmTick()
 
 void drawUiFrame()
 {
+  const int psuTopShift = TAB_H - 24; // 24 was original tab height baseline
+  const int contentTop = TAB_H;
+  const int contentBottom = 270;
+  const int contentH = contentBottom - contentTop;
+  const int rowH = contentH / 3;
+  const int row0CenterY = contentTop + rowH / 2;
+  const int row1CenterY = contentTop + rowH + rowH / 2;
+  const int row2CenterY = contentTop + rowH * 2 + rowH / 2;
+  const int inputBoxY = 30 + psuTopShift;
+  const int inputLabelY = 34 + psuTopShift;
+  const int inputValueY = 64 + psuTopShift;
+
   lcd.fillScreen(TFT_BLACK);
   drawTabBar(AppTab::PowerSupply);
-
-  // ── LEFT: horizontal dividers between rows ──────────────────────────
-  lcd.drawFastHLine(0, 106, RPX, COLOR_BORDER);
-  lcd.drawFastHLine(0, 188, RPX, COLOR_BORDER);
 
   // ── LEFT: vertical divider ──────────────────────────────────────────
   lcd.drawFastVLine(RPX, TAB_H, 270 - TAB_H, COLOR_BORDER);
@@ -1642,12 +1627,12 @@ void drawUiFrame()
   lcd.loadFont(Weimar_Medium_70);
   lcd.setTextColor(COLOR_VOLT, TFT_BLACK);
   lcd.setTextDatum(MR_DATUM);
-  lcd.drawString("00.00", 260, 65);
+  lcd.drawString("00.00", 260, row0CenterY);
   lcd.unloadFont();
   lcd.loadFont(Weimar_Medium_26);
   lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("V", 268, 65);
+  lcd.drawString("V", 268, row0CenterY);
   lcd.unloadFont();
   lcd.setTextFont(4);
 
@@ -1655,12 +1640,12 @@ void drawUiFrame()
   lcd.loadFont(Weimar_Medium_70);
   lcd.setTextColor(COLOR_AMP, TFT_BLACK);
   lcd.setTextDatum(MR_DATUM);
-  lcd.drawString("0.000", 260, 147);
+  lcd.drawString("0.000", 260, row1CenterY);
   lcd.unloadFont();
   lcd.loadFont(Weimar_Medium_26);
   lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("A", 268, 147);
+  lcd.drawString("A", 268, row1CenterY);
   lcd.unloadFont();
   lcd.setTextFont(4);
 
@@ -1668,12 +1653,12 @@ void drawUiFrame()
   lcd.loadFont(Weimar_Medium_70);
   lcd.setTextColor(COLOR_WATT, TFT_BLACK);
   lcd.setTextDatum(MR_DATUM);
-  lcd.drawString("0.000", 260, 229);
+  lcd.drawString("0.000", 260, row2CenterY);
   lcd.unloadFont();
   lcd.loadFont(Weimar_Medium_26);
   lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("W", 268, 229);
+  lcd.drawString("W", 268, row2CenterY);
   lcd.unloadFont();
   lcd.setTextFont(4);
 
@@ -1681,15 +1666,15 @@ void drawUiFrame()
   lcd.fillRect(RPX + 1, TAB_H, RPW - 1, 270 - TAB_H, COLOR_PANEL);
 
   // ── RIGHT: Input box (y 30..93) ──────────────────────────────────────
-  lcd.drawRect(RPX + 6, 30, RPW - 12, 64, COLOR_BORDER);
+  lcd.drawRect(RPX + 6, inputBoxY, RPW - 12, 64, COLOR_BORDER);
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_LABEL, COLOR_PANEL);
   lcd.setTextDatum(TL_DATUM);
-  lcd.drawString("Input", RPX + 12, 34);
+  lcd.drawString("Input", RPX + 12, inputLabelY);
   lcd.setTextFont(4);
   lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
   lcd.setTextDatum(MR_DATUM);
-  lcd.drawString("-- V", RPX + RPW - 14, 64);
+  lcd.drawString("-- V", RPX + RPW - 14, inputValueY);
 
   // ── RIGHT: Vshunt box (y 98..151) ────────────────────────────────────
   lcd.drawRect(RPX + 6, 98, RPW - 12, 54, COLOR_BORDER);
@@ -1724,41 +1709,44 @@ void drawUiFrame()
   lcd.drawString("CV", RPX + RPW / 2, 224);
 
   // ── BOTTOM BAR (full width, y 270..319) ─────────────────────────────
+  const int secW = 160;
+  const int barLabelY = 283;
+  const int barValueY = 305;
   lcd.fillRect(0, 270, 480, 50, COLOR_BAR_BG);
   lcd.drawFastHLine(0, 270, 480, COLOR_BORDER);
 
-  // V-SET section (x 0..199)
+  // V-SET section (x 0..159)
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_SETV, COLOR_BAR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("V-SET", 8, 283);
+  lcd.drawString("V-SET", 8, barLabelY);
   lcd.setTextFont(4);
   lcd.setTextColor(COLOR_TEXT, COLOR_BAR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("05.00 V", 8, 305);
+  lcd.drawString("05.00 V", 8, barValueY);
 
   // Divider
-  lcd.drawFastVLine(190, 274, 42, COLOR_BORDER);
+  lcd.drawFastVLine(secW, 274, 42, COLOR_BORDER);
 
-  // I-SET section (x 200..379)
+  // I-SET section (x 160..319)
   lcd.setTextFont(2);
   lcd.setTextColor(COLOR_SETI, COLOR_BAR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("I-SET", 200, 283);
+  lcd.drawString("I-SET", secW + 8, barLabelY);
   lcd.setTextFont(4);
   lcd.setTextColor(COLOR_TEXT, COLOR_BAR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("0.000 A", 200, 305);
+  lcd.drawString("0.000 A", secW + 8, barValueY);
 
   // Divider
-  lcd.drawFastVLine(380, 274, 42, COLOR_BORDER);
+  lcd.drawFastVLine(secW * 2, 274, 42, COLOR_BORDER);
 
-  // RUN indicator (x 380..479)
-  lcd.fillCircle(420, 295, 8, COLOR_RUN);
+  // RUN indicator (x 320..479)
+  lcd.fillCircle(secW * 2 + 40, 295, 8, COLOR_RUN);
   lcd.setTextFont(4);
   lcd.setTextColor(COLOR_RUN, COLOR_BAR_BG);
   lcd.setTextDatum(ML_DATUM);
-  lcd.drawString("RUN", 434, 295);
+  lcd.drawString("RUN", secW * 2 + 54, 295);
 
   lcd.setTextDatum(TL_DATUM);
 }
@@ -1770,6 +1758,20 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
 {
   if (activeTab != AppTab::PowerSupply)
     return;
+  const int psuTopShift = TAB_H - 24; // keep power tab content clear of taller tab bar
+  const int contentTop = TAB_H;
+  const int contentBottom = 270;
+  const int contentH = contentBottom - contentTop;
+  const int rowH = contentH / 3;
+  const int row0TopY = contentTop + (rowH - psuRowSpriteH) / 2;
+  const int row1TopY = contentTop + rowH + (rowH - psuRowSpriteH) / 2;
+  const int row2TopY = contentTop + rowH * 2 + (rowH - psuRowSpriteH) / 2;
+  const int row0CenterY = contentTop + rowH / 2;
+  const int row1CenterY = contentTop + rowH + rowH / 2;
+  const int row2CenterY = contentTop + rowH * 2 + rowH / 2;
+  const int inputValueBoxY = 50 + psuTopShift;
+  const int inputValueY = 64 + psuTopShift;
+  const int secW = 160;
   char buf[24];
 
   // ── VOLTAGE + Input right panel (left row 0, y 24..105) ─────────────
@@ -1783,38 +1785,38 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
       rowSprite.setTextColor(COLOR_VOLT, TFT_BLACK);
       rowSprite.setTextDatum(MR_DATUM);
       snprintf(buf, sizeof(buf), "%05.2f", vout);
-      rowSprite.drawString(buf, 259, 40); // relative to sprite origin (1,25)
+      rowSprite.drawString(buf, 259, psuRowTextY);
       rowSprite.unloadFont();
       rowSprite.loadFont(Weimar_Medium_26);
       rowSprite.setTextColor(COLOR_LABEL, TFT_BLACK);
       rowSprite.setTextDatum(ML_DATUM);
-      rowSprite.drawString("V", 267, 40);
+      rowSprite.drawString("V", 267, psuRowTextY);
       rowSprite.unloadFont();
-      rowSprite.pushSprite(1, 25);
+      rowSprite.pushSprite(1, row0TopY);
     }
     else
     {
-      lcd.fillRect(1, 25, RPX - 2, 80, TFT_BLACK);
+      lcd.fillRect(1, row0TopY, RPX - 2, psuRowSpriteH, TFT_BLACK);
       lcd.loadFont(Weimar_Medium_70);
       lcd.setTextColor(COLOR_VOLT, TFT_BLACK);
       lcd.setTextDatum(MR_DATUM);
       snprintf(buf, sizeof(buf), "%05.2f", vout);
-      lcd.drawString(buf, 260, 65);
+      lcd.drawString(buf, 260, row0CenterY);
       lcd.unloadFont();
       lcd.loadFont(Weimar_Medium_26);
       lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
       lcd.setTextDatum(ML_DATUM);
-      lcd.drawString("V", 268, 65);
+      lcd.drawString("V", 268, row0CenterY);
       lcd.unloadFont();
       lcd.setTextFont(4);
     }
     // also update Input box (right panel)
-    lcd.fillRect(RPX + 8, 50, RPW - 16, 36, COLOR_PANEL);
+    lcd.fillRect(RPX + 8, inputValueBoxY, RPW - 16, 36, COLOR_PANEL);
     lcd.setTextFont(4);
     lcd.setTextColor(COLOR_TEXT, COLOR_PANEL);
     lcd.setTextDatum(MR_DATUM);
     snprintf(buf, sizeof(buf), "%05.2f V", vout);
-    lcd.drawString(buf, RPX + RPW - 14, 64);
+    lcd.drawString(buf, RPX + RPW - 14, inputValueY);
   }
 
   // ── CURRENT (left row 1, y 106..187) ────────────────────────────────
@@ -1828,28 +1830,28 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
       rowSprite.setTextColor(COLOR_AMP, TFT_BLACK);
       rowSprite.setTextDatum(MR_DATUM);
       snprintf(buf, sizeof(buf), "%.3f", iout);
-      rowSprite.drawString(buf, 259, 40); // relative to sprite origin (1,107)
+      rowSprite.drawString(buf, 259, psuRowTextY);
       rowSprite.unloadFont();
       rowSprite.loadFont(Weimar_Medium_26);
       rowSprite.setTextColor(COLOR_LABEL, TFT_BLACK);
       rowSprite.setTextDatum(ML_DATUM);
-      rowSprite.drawString("A", 267, 40);
+      rowSprite.drawString("A", 267, psuRowTextY);
       rowSprite.unloadFont();
-      rowSprite.pushSprite(1, 107);
+      rowSprite.pushSprite(1, row1TopY);
     }
     else
     {
-      lcd.fillRect(1, 107, RPX - 2, 80, TFT_BLACK);
+      lcd.fillRect(1, row1TopY, RPX - 2, psuRowSpriteH, TFT_BLACK);
       lcd.loadFont(Weimar_Medium_70);
       lcd.setTextColor(COLOR_AMP, TFT_BLACK);
       lcd.setTextDatum(MR_DATUM);
       snprintf(buf, sizeof(buf), "%.3f", iout);
-      lcd.drawString(buf, 260, 147);
+      lcd.drawString(buf, 260, row1CenterY);
       lcd.unloadFont();
       lcd.loadFont(Weimar_Medium_26);
       lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
       lcd.setTextDatum(ML_DATUM);
-      lcd.drawString("A", 268, 147);
+      lcd.drawString("A", 268, row1CenterY);
       lcd.unloadFont();
       lcd.setTextFont(4);
     }
@@ -1871,27 +1873,27 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
       rowSprite.loadFont(Weimar_Medium_70);
       rowSprite.setTextColor(COLOR_WATT, TFT_BLACK);
       rowSprite.setTextDatum(MR_DATUM);
-      rowSprite.drawString(buf, 259, 40); // relative to sprite origin (1,189)
+      rowSprite.drawString(buf, 259, psuRowTextY);
       rowSprite.unloadFont();
       rowSprite.loadFont(Weimar_Medium_26);
       rowSprite.setTextColor(COLOR_LABEL, TFT_BLACK);
       rowSprite.setTextDatum(ML_DATUM);
-      rowSprite.drawString("W", 267, 40);
+      rowSprite.drawString("W", 267, psuRowTextY);
       rowSprite.unloadFont();
-      rowSprite.pushSprite(1, 189);
+      rowSprite.pushSprite(1, row2TopY);
     }
     else
     {
-      lcd.fillRect(1, 189, RPX - 2, 80, TFT_BLACK);
+      lcd.fillRect(1, row2TopY, RPX - 2, psuRowSpriteH, TFT_BLACK);
       lcd.loadFont(Weimar_Medium_70);
       lcd.setTextColor(COLOR_WATT, TFT_BLACK);
       lcd.setTextDatum(MR_DATUM);
-      lcd.drawString(buf, 260, 229);
+      lcd.drawString(buf, 260, row2CenterY);
       lcd.unloadFont();
       lcd.loadFont(Weimar_Medium_26);
       lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
       lcd.setTextDatum(ML_DATUM);
-      lcd.drawString("W", 268, 229);
+      lcd.drawString("W", 268, row2CenterY);
       lcd.unloadFont();
       lcd.setTextFont(4);
     }
@@ -1941,7 +1943,7 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
   if (vset != uiTargetV)
   {
     uiTargetV = vset;
-    lcd.fillRect(0, 296, 190, 24, COLOR_BAR_BG);
+    lcd.fillRect(0, 296, secW, 24, COLOR_BAR_BG);
     lcd.setTextFont(4);
     lcd.setTextColor(COLOR_TEXT, COLOR_BAR_BG);
     lcd.setTextDatum(ML_DATUM);
@@ -1953,12 +1955,12 @@ void updateUi(float vout, float iout, float vset, float iset, float power, float
   if (iset != uiIset)
   {
     uiIset = iset;
-    lcd.fillRect(190, 296, 190, 24, COLOR_BAR_BG);
+    lcd.fillRect(secW, 296, secW, 24, COLOR_BAR_BG);
     lcd.setTextFont(4);
     lcd.setTextColor(COLOR_TEXT, COLOR_BAR_BG);
     lcd.setTextDatum(ML_DATUM);
     snprintf(buf, sizeof(buf), "%.3f A", iset);
-    lcd.drawString(buf, 200, 305);
+    lcd.drawString(buf, secW + 8, 305);
   }
 
   lcd.setTextDatum(TL_DATUM);
@@ -2071,11 +2073,16 @@ static bool pointInRect(const lgfx::touch_point_t &tp, int x, int y, int w, int 
   return tp.x >= x && tp.x < (x + w) && tp.y >= y && tp.y < (y + h);
 }
 
-static int checkButtonTouch(int tx, int ty, Button *buttons, int count)
+static bool pointInRectPadded(int tx, int ty, int x, int y, int w, int h, int pad)
+{
+  return tx >= (x - pad) && tx <= (x + w + pad) &&
+         ty >= (y - pad) && ty <= (y + h + pad);
+}
+
+static int checkButtonTouch(int tx, int ty, Button *buttons, int count, int pad = 0)
 {
   for (int i = 0; i < count; i++)
-    if (tx >= buttons[i].x && tx <= buttons[i].x + buttons[i].w &&
-        ty >= buttons[i].y && ty <= buttons[i].y + buttons[i].h)
+    if (pointInRectPadded(tx, ty, buttons[i].x, buttons[i].y, buttons[i].w, buttons[i].h, pad))
       return i;
   return -1;
 }
@@ -2118,7 +2125,7 @@ static void handleTouch()
     if (activeInput != InputField::None)
     {
       // ── Numpad screen ──────────────────────────────────────────────
-      int btn = checkButtonTouch(tx, ty, numpadButtons, 14);
+      int btn = checkButtonTouch(tx, ty, numpadButtons, 14, TOUCH_PAD_NUMPAD);
       if (btn >= 0 && btn <= 10)
       {
         // digits + "."
@@ -2217,7 +2224,7 @@ static void handleTouch()
       // ── Multimeter tab: volt range buttons (side panel, y < 292) ────
       else if (activeTab == AppTab::Multimeter && (meterMode == MeterMode::VOLT_DC || meterMode == MeterMode::VOLT_AC) && ty < 292)
       {
-        int btn = checkButtonTouch(tx, ty, voltRangeButtons, 3);
+        int btn = checkButtonTouch(tx, ty, voltRangeButtons, 3, TOUCH_PAD_VOLT_RANGE);
         if (btn >= 0)
         {
           if (btn == 0)
@@ -2236,14 +2243,16 @@ static void handleTouch()
             voltActivateRange(VoltRange::HI);
           }
           voltLastMv = -9999.0f;
+          voltLastOverload = false;
           voltBtnSpriteOk = false; // force sprite redraw với mode mới
           drawMultimeterScreen();
           return;
         }
       }
-      else if (activeTab == AppTab::Multimeter && ty >= 292 && ty <= 319)
+      else if (activeTab == AppTab::Multimeter &&
+               ty >= (292 - TOUCH_PAD_MODE_BAR_Y) && ty <= 319)
       {
-        if (tx < 60)
+        if (tx < (60 + TOUCH_PAD_MODE_BAR_Y))
         {
           // ZERO button
           ohmAdcOffsetMv = 0.0f;
@@ -2262,11 +2271,11 @@ static void handleTouch()
         }
         else
         {
-          MeterMode newMode = (tx < 50)    ? meterMode // ZERO btn — no mode change
-                              : (tx < 120) ? MeterMode::OHM
-                              : (tx < 190) ? MeterMode::DIODE
-                              : (tx < 260) ? MeterMode::VOLT_DC
-                              : (tx < 330) ? MeterMode::VOLT_AC
+          MeterMode newMode = (tx < (50 + TOUCH_PAD_MODE_BAR_Y))    ? meterMode // ZERO btn — no mode change
+                              : (tx < (120 + TOUCH_PAD_MODE_BAR_Y)) ? MeterMode::OHM
+                              : (tx < (190 + TOUCH_PAD_MODE_BAR_Y)) ? MeterMode::DIODE
+                              : (tx < (260 + TOUCH_PAD_MODE_BAR_Y)) ? MeterMode::VOLT_DC
+                              : (tx < (330 + TOUCH_PAD_MODE_BAR_Y)) ? MeterMode::VOLT_AC
                                            : MeterMode::CAP;
 
           if (newMode != meterMode)
@@ -2274,35 +2283,13 @@ static void handleTouch()
             meterMode = newMode;
             capTaskRunning = false; // abandon any running cap measurement
             capResultReady = false;
-            ohmLastRx = ohmLastVmV = ohmLastVf = capLastPf = voltLastMv = -1.0f;
+            ohmLastRx = ohmLastVmV = ohmLastVf = capLastPf = -1.0f;
+            voltLastMv = -9999.0f;
+            voltLastOverload = false;
             esrLastOhm = -1.0f;
             ohmLastOL = false;
             ohmLastRange = (OhmRange)99;
-            // Header
-            lcd.fillRect(0, TAB_H, 480, 28, COLOR_PANEL);
-            lcd.drawFastHLine(0, TAB_H + 28, 480, 0x07FFu);
-            lcd.setTextFont(2);
-            lcd.setTextColor(0x07FFu, COLOR_PANEL);
-            lcd.setTextDatum(ML_DATUM);
-            lcd.drawString(meterModeHeader(), 10, TAB_H + 14);
-            lcd.setTextDatum(TL_DATUM);
-            // Mode label
-            lcd.fillRect(0, TAB_H + 29, 480, 18, TFT_BLACK);
-            lcd.setTextFont(2);
-            lcd.setTextColor(COLOR_LABEL, TFT_BLACK);
-            lcd.setTextDatum(TL_DATUM);
-            lcd.drawString(meterModeLabel(), 10, TAB_H + 30);
-            // ADC/Charge label
-            lcd.fillRect(0, TAB_H + 177, 340, 14, COLOR_BG);
-            lcd.setTextFont(2);
-            lcd.setTextColor(COLOR_LABEL, COLOR_BG);
-            lcd.setTextDatum(TL_DATUM);
-            lcd.drawString(meterMode == MeterMode::CAP ? "Charge Time" : "ADC Voltage",
-                           10, TAB_H + 179);
-            // Clear value areas
-            lcd.fillRect(5, TAB_H + 46, 470, 145, TFT_BLACK);
-            lcd.fillRect(5, TAB_H + 229, 470, 39, COLOR_BG);
-            drawMeterModeButtons();
+            drawMultimeterScreen();
             if (newMode == MeterMode::VOLT_DC || newMode == MeterMode::VOLT_AC)
               voltActivateRange(VoltRange::LO);
             else
@@ -2313,8 +2300,8 @@ static void handleTouch()
       // ── Main screen (PowerSupply tab only) ──────────────────────────
       else if (activeTab == AppTab::PowerSupply)
       {
-        // V-SET touch: bottom bar left (x 0..189, y 270..319)
-        if (tx >= 0 && tx <= 189 && ty >= 270 && ty <= 319)
+        // V-SET touch: bottom bar left (x 0..159, y 270..319)
+        if (pointInRectPadded(tx, ty, 0, 270, 160, 50, TOUCH_PAD_SET_BAR))
         {
           activeInput = InputField::Vset;
           snprintf(inputText, sizeof(inputText), "0");
@@ -2322,8 +2309,8 @@ static void handleTouch()
           numpadValue_[sizeof(numpadValue_) - 1] = '\0';
           drawNumpadScreen();
         }
-        // I-SET touch: bottom bar middle (x 191..379, y 270..319)
-        else if (tx >= 191 && tx <= 379 && ty >= 270 && ty <= 319)
+        // I-SET touch: bottom bar middle (x 160..319, y 270..319)
+        else if (pointInRectPadded(tx, ty, 160, 270, 160, 50, TOUCH_PAD_SET_BAR))
         {
           activeInput = InputField::Iset;
           snprintf(inputText, sizeof(inputText), "0");
@@ -2560,8 +2547,15 @@ void setup()
   bool hasPsram = psramFound();
   rowSprite.setPsram(hasPsram);
   rowSprite.setColorDepth(16);
-  rowSpriteOk = rowSprite.createSprite(308, 80);
-  Serial.printf("Sprite 308x80: %s (%s)\n", rowSpriteOk ? "OK" : "FAILED – direct draw", hasPsram ? "PSRAM" : "heap");
+  int rowAreaH = (270 - TAB_H) / 3;
+  psuRowSpriteH = rowAreaH - 2;
+  if (psuRowSpriteH > 80)
+    psuRowSpriteH = 80;
+  if (psuRowSpriteH < 64)
+    psuRowSpriteH = 64;
+  psuRowTextY = psuRowSpriteH / 2;
+  rowSpriteOk = rowSprite.createSprite(308, psuRowSpriteH);
+  Serial.printf("Sprite 308x%d: %s (%s)\n", psuRowSpriteH, rowSpriteOk ? "OK" : "FAILED – direct draw", hasPsram ? "PSRAM" : "heap");
 
   // Init ohmmeter ADC + range GPIOs
   analogReadResolution(12);
