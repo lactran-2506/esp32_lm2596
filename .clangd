@@ -1,0 +1,24 @@
+CompileFlags:
+  Add:
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/cores/esp32"
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src"
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src"
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include"
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/driver/include"
+    - "-I/Users/admin/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/esp_timer/include"
+    - "-I/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/src"
+    - "-I/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/LovyanGFX/src"
+    - "-I/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/INA226"
+    - "-I/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/MCP4725"
+    - "-target"
+    - "xtensa-esp32s3-elf"
+    - "-fsyntax-only"
+  Remove:
+    - "-mfloat-abi=*"
+    - "-mfpu=*"
+
+Diagnostics:
+  ClangTidy:
+    Add: [readability-*, modernize-*]
+    Remove: [modernize-use-trailing-return-type]
+  UnusedIncludes: Strict

@@ -1,0 +1,17 @@
+{
+    "clangd.arguments": [
+        "-compile-commands-dir=${workspaceFolder}",
+        "--header-insertion=never",
+        "--background-index",
+        "--compile-commands=.pio/build/esp32-s3-devkitc-1/compile_commands.json"
+    ],
+    "C_Cpp.default.includePath": [
+        "/Users/admin/.platformio/packages/framework-arduinoespressif32/cores/esp32",
+        "/Users/admin/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
+        "/Users/admin/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
+        "/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/src",
+        "/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/LovyanGFX/src",
+        "/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/INA226",
+        "/Users/admin/Documents/PlatformIO/Projects/ESP32 INA226/.pio/libdeps/esp32-s3-devkitc-1/MCP4725"
+    ]
+}
